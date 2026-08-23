@@ -1,0 +1,8 @@
+data_dir = "data"
+addr = ":8080"
+session_days = 1
+
+[[users]]
+user = "demo"
+pass = "demo"
+directory = "demo"

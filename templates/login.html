@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ログイン</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(circle at 50% 20%, #1a1f2e 0%, #0a0c12 70%);
+    font-family: "SF Mono", "Consolas", monospace;
+    color: #e4e6eb;
+  }
+  .card {
+    width: 320px;
+    padding: 40px 32px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  }
+  h1 {
+    font-size: 15px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #7dd3fc;
+    margin: 0 0 24px;
+    text-align: center;
+  }
+  label {
+    display: block;
+    font-size: 12px;
+    color: #9ca3af;
+    margin-bottom: 6px;
+  }
+  input {
+    width: 100%;
+    padding: 10px 12px;
+    margin-bottom: 18px;
+    background: #14161f;
+    border: 1px solid #2a2d3a;
+    border-radius: 6px;
+    color: #e4e6eb;
+    font-family: inherit;
+    font-size: 14px;
+  }
+  input:focus {
+    outline: none;
+    border-color: #7dd3fc;
+  }
+  button {
+    width: 100%;
+    padding: 10px;
+    background: #7dd3fc;
+    border: none;
+    border-radius: 6px;
+    color: #0a0c12;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover {
+    background: #93ddfd;
+  }
+  .error {
+    color: #f87171;
+    font-size: 12px;
+    margin-bottom: 16px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>&gt; Access Portal</h1>
+  {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
+  <form method="POST" action="/login">
+    <label for="user">USER</label>
+    <input type="text" id="user" name="user" autocomplete="username" required autofocus>
+    <label for="pass">PASSWORD</label>
+    <input type="password" id="pass" name="pass" autocomplete="current-password" required>
+    <button type="submit">ログイン</button>
+  </form>
+</div>
+</body>
+</html>

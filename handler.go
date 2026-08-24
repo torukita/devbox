@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"html/template"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,61 @@ const (
 	userCtxKey        ctxKey = "user"
 	sessionCookieName string = "session_id"
 )
+
+// responseWriterWrapper: 出力されたHTTPステータスコードをキャプチャするためのラッパー
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriterWrapper) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// loggingMiddleware: すべてのリクエストのアクセスログ（IP、ユーザー名、メソッド、URL、ステータスコード、処理時間）を出力
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		wrapped := &responseWriterWrapper{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start)
+
+		// ログイン中のユーザー名を取得（セッションCookieが存在すれば取得）
+		userName := "-"
+		if cookie, err := r.Cookie(sessionCookieName); err == nil {
+			if u := sessions.Get(cookie.Value); u != nil {
+				userName = u.User
+			}
+		}
+
+		// ダウンロードリクエストの場合は [DOWNLOAD] として出力
+		if strings.HasPrefix(r.URL.Path, "/download/") {
+			filename := filepath.Base(strings.TrimPrefix(r.URL.Path, "/download/"))
+			log.Printf("[DOWNLOAD] IP: %s | ユーザー: %s | ファイル: %s %d (%v)",
+				r.RemoteAddr,
+				userName,
+				filename,
+				wrapped.statusCode,
+				duration,
+			)
+			return
+		}
+
+		// 通常のリクエストは [ACCESS] として出力
+		log.Printf("[ACCESS]   IP: %s | ユーザー: %s | %s %s %d (%v)",
+			r.RemoteAddr,
+			userName,
+			r.Method,
+			r.RequestURI,
+			wrapped.statusCode,
+			duration,
+		)
+	})
+}
+
 
 // sessionMiddleware: Cookieのセッションを検証し、未ログインならログイン画面へ
 func sessionMiddleware(next http.HandlerFunc) http.HandlerFunc {

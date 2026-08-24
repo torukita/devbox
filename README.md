@@ -25,6 +25,20 @@ go build -o devbox .
 go run . devbox.toml
 ```
 
+### ログをファイルに出力して起動する例
+
+アクセスログをファイルに保存しながら起動したい場合の例です（bash / zsh）。
+
+- **バックグラウンド実行（ログをファイルに追記保存）:**
+  ```bash
+  ./devbox devbox.toml >> devbox.log 2>&1 &
+  ```
+
+- **screen 等で画面にログを表示しつつファイルにも保存（`tee` を使用）:**
+  ```bash
+  ./devbox devbox.toml 2>&1 | tee -a devbox.log
+  ```
+
 ## devbox.toml の書き方
 
 ```toml

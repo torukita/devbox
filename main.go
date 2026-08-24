@@ -42,5 +42,5 @@ func main() {
 	mux.HandleFunc("/download/", sessionMiddleware(downloadHandler))
 
 	log.Printf("起動: %s (data_dir=%s, session_days=%d)", cfg.Addr, cfg.DataDir, cfg.SessionDays)
-	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
+	log.Fatal(http.ListenAndServe(cfg.Addr, loggingMiddleware(mux)))
 }

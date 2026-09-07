@@ -32,6 +32,18 @@ func (rw *responseWriterWrapper) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// clientIP: X-Forwarded-Forヘッダー（先頭のIP）があればそれを、なければRemoteAddrを返す
+// cloudflaredなどのプロキシ経由の場合、RemoteAddrはプロキシのアドレスになるため
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	return r.RemoteAddr
+}
+
 // loggingMiddleware: すべてのリクエストのアクセスログ（IP、ユーザー名、メソッド、URL、ステータスコード、処理時間）を出力
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -50,11 +62,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
+		ip := clientIP(r)
+
 		// ダウンロードリクエストの場合は [DOWNLOAD] として出力
 		if strings.HasPrefix(r.URL.Path, "/download/") {
 			filename := filepath.Base(strings.TrimPrefix(r.URL.Path, "/download/"))
-			log.Printf("[DOWNLOAD] IP: %s | ユーザー: %s | ファイル: %s %d (%v)",
-				r.RemoteAddr,
+			log.Printf("[DOWNLOAD] IP: %s | user: %s | file: %s %d (%v)",
+				ip,
 				userName,
 				filename,
 				wrapped.statusCode,
@@ -64,8 +78,8 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		}
 
 		// 通常のリクエストは [ACCESS] として出力
-		log.Printf("[ACCESS]   IP: %s | ユーザー: %s | %s %s %d (%v)",
-			r.RemoteAddr,
+		log.Printf("[ACCESS]   IP: %s | user: %s | %s %s %d (%v)",
+			ip,
 			userName,
 			r.Method,
 			r.RequestURI,
@@ -74,7 +88,6 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		)
 	})
 }
-
 
 // sessionMiddleware: Cookieのセッションを検証し、未ログインならログイン画面へ
 func sessionMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -102,13 +115,13 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPost:
 		if err := r.ParseForm(); err != nil {
-			http.Error(w, "不正なリクエスト", http.StatusBadRequest)
+			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
 		u := cfg.findUser(r.FormValue("user"), r.FormValue("pass"))
 		if u == nil {
 			tmpl.ExecuteTemplate(w, "login.html", struct{ Error string }{
-				Error: "ユーザー名またはパスワードが違います",
+				Error: "Invalid username or password",
 			})
 			return
 		}
@@ -116,7 +129,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		ttl := time.Duration(cfg.SessionDays) * 24 * time.Hour
 		sid, err := sessions.Create(u, ttl)
 		if err != nil {
-			http.Error(w, "セッション作成エラー", http.StatusInternalServerError)
+			http.Error(w, "could not make session", http.StatusInternalServerError)
 			return
 		}
 		http.SetCookie(w, &http.Cookie{
@@ -130,7 +143,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 
 	default:
-		http.Error(w, "許可されていないメソッド", http.StatusMethodNotAllowed)
+		http.Error(w, "method is not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -141,7 +154,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	mdPath := filepath.Join(cfg.DataDir, u.Directory, "index.md")
 	content, err := os.ReadFile(mdPath)
 	if err != nil {
-		http.Error(w, "ページが見つかりません", http.StatusNotFound)
+		http.Error(w, "Page not found", http.StatusNotFound)
 		return
 	}
 

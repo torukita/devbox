@@ -38,7 +38,10 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login", loginHandler)
-	mux.HandleFunc("/", sessionMiddleware(indexHandler))
+	// "/{$}" は "/" にのみ厳密一致するパターン(Go 1.22+)。
+	// 単なる "/" だとサブツリーパターン扱いになり、未定義パス(例: /hoge)も
+	// 全てここにマッチしてしまうため、それらを404にするために使用する。
+	mux.HandleFunc("/{$}", sessionMiddleware(indexHandler))
 	mux.HandleFunc("/download/", sessionMiddleware(downloadHandler))
 
 	log.Printf("起動: %s (data_dir=%s, session_days=%d)", cfg.Addr, cfg.DataDir, cfg.SessionDays)

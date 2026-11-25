@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/kong"
 )
@@ -201,6 +203,10 @@ directory = "demo"
 		}
 		return entry
 	}
+	lastRawLog := func() string {
+		lines := strings.Split(strings.TrimSpace(logBuf.String()), "\n")
+		return lines[len(lines)-1]
+	}
 
 	// 1. ログイン失敗
 	form := url.Values{"user": {"wronguser"}, "pass": {"bad"}}
@@ -216,11 +222,23 @@ directory = "demo"
 		t.Fatalf("ログイン失敗時のステータス不正: %d", rec.Code)
 	}
 	entry := decodeLastLog()
-	if entry["msg"] != "ログイン失敗" || entry["level"] != "WARN" || entry["user"] != "wronguser" {
+	if entry["msg"] != "user login failed" || entry["level"] != "WARN" || entry["user"] != "wronguser" {
 		t.Errorf("ログイン失敗ログ不正: %v", entry)
 	}
-	if entry["ip"] != "203.0.113.10" || entry["country"] != "JP" || entry["cf_ray"] != "ray-001" {
+	if httpStr, ok := entry["http"].(string); !ok || !strings.HasPrefix(httpStr, "POST /login 200 (") {
+		t.Errorf("httpフォーマット不正: %v", entry["http"])
+	}
+	cfMap, ok := entry["cf"].(map[string]any)
+	if !ok || entry["ip"] != "203.0.113.10" || cfMap["country"] != "JP" || cfMap["ray"] != "ray-001" {
 		t.Errorf("Cloudflareヘッダー記録不正: %v", entry)
+	}
+	rawLine := lastRawLog()
+	idxHTTP := strings.Index(rawLine, `"http":`)
+	idxIP := strings.Index(rawLine, `"ip":`)
+	idxUser := strings.Index(rawLine, `"user":`)
+	idxCF := strings.Index(rawLine, `"cf":`)
+	if !(idxHTTP > 0 && idxHTTP < idxIP && idxIP < idxUser && idxUser < idxCF) {
+		t.Errorf("JSONキー順序不正 (http -> ip -> user -> cf): %s", rawLine)
 	}
 
 	// 2. ログイン成功
@@ -241,8 +259,11 @@ directory = "demo"
 	}
 	sessionCookie := cookies[0]
 	entry = decodeLastLog()
-	if entry["msg"] != "ログイン成功" || entry["user"] != "demo" {
+	if entry["msg"] != "user login succeeded" || entry["user"] != "demo" {
 		t.Errorf("ログイン成功ログ不正: %v", entry)
+	}
+	if httpStr, ok := entry["http"].(string); !ok || !strings.HasPrefix(httpStr, "POST /login 303 (") {
+		t.Errorf("ログイン成功httpフォーマット不正: %v", entry["http"])
 	}
 
 	// 3. トップページ表示
@@ -254,8 +275,11 @@ directory = "demo"
 		t.Fatalf("indexステータス不正: %d", rec.Code)
 	}
 	entry = decodeLastLog()
-	if entry["msg"] != "アクセス" || entry["user"] != "demo" || entry["path"] != "/" {
+	if entry["msg"] != "request handled" || entry["user"] != "demo" {
 		t.Errorf("アクセスログ不正: %v", entry)
+	}
+	if httpStr, ok := entry["http"].(string); !ok || !strings.HasPrefix(httpStr, "GET / 200 (") {
+		t.Errorf("アクセスhttpフォーマット不正: %v", entry["http"])
 	}
 
 	// 4. ファイルダウンロード
@@ -267,14 +291,16 @@ directory = "demo"
 		t.Fatalf("ダウンロードステータス不正: %d", rec.Code)
 	}
 	entry = decodeLastLog()
-	if entry["msg"] != "ダウンロード" || entry["path"] != "/download/sample.txt" {
+	if entry["msg"] != "file downloaded" {
 		t.Errorf("ダウンロードログ不正: %v", entry)
 	}
-	if _, exists := entry["file"]; exists {
-		t.Errorf("不要なfileキーが出力されています: %v", entry)
+	if httpStr, ok := entry["http"].(string); !ok || !strings.HasPrefix(httpStr, "GET /download/sample.txt 200 (") {
+		t.Errorf("ダウンロードhttpフォーマット不正: %v", entry["http"])
 	}
-	if int(entry["file_size"].(float64)) != len(sampleBytes) || int(entry["bytes"].(float64)) != len(sampleBytes) {
-		t.Errorf("サイズ計測不正: file_size=%v bytes=%v want=%d", entry["file_size"], entry["bytes"], len(sampleBytes))
+	for _, unwanted := range []string{"file", "file_size", "bytes"} {
+		if _, exists := entry[unwanted]; exists {
+			t.Errorf("不要な%sキーが出力されています: %v", unwanted, entry)
+		}
 	}
 
 	// 5. /download/ 単体やサブディレクトリ配下・パストラバーサルは404
@@ -302,8 +328,8 @@ directory = "demo"
 	if entry["ip"] != "192.0.2.50" {
 		t.Errorf("cloudflare=false時のIP不正: got %v want 192.0.2.50", entry["ip"])
 	}
-	if _, exists := entry["country"]; exists {
-		t.Errorf("cloudflare=false時にcountryが出力されています: %v", entry)
+	if _, exists := entry["cf"]; exists {
+		t.Errorf("cloudflare=false時にcfが出力されています: %v", entry)
 	}
 }
 
@@ -318,14 +344,56 @@ func TestNewLoggerFileOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newLogger失敗: %v", err)
 	}
-	logger.Info("起動", slog.String("addr", ":8080"))
+	logger.Info("server started", slog.String("addr", ":8080"))
 	cleanup()
 
 	raw, err := os.ReadFile(c.LogFile)
 	if err != nil {
 		t.Fatalf("ログファイル読み込み失敗: %v", err)
 	}
-	if !strings.Contains(string(raw), `"msg":"起動"`) {
+	if !strings.Contains(string(raw), `"msg":"server started"`) {
 		t.Errorf("ログファイル出力内容が想定外です: %s", string(raw))
+	}
+}
+
+func TestRunServerGracefulShutdown(t *testing.T) {
+	for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM} {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		srv := &http.Server{
+			Addr:    "127.0.0.1:0",
+			Handler: http.NewServeMux(),
+		}
+		sigCh := make(chan os.Signal, 1)
+		stopped := false
+
+		done := make(chan error, 1)
+		go func() {
+			done <- runServer(srv, logger, sigCh, func() { stopped = true })
+		}()
+
+		time.Sleep(15 * time.Millisecond)
+		sigCh <- sig
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("runServer(%v)エラー: %v", sig, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("runServer(%v)がタイムアウトしました", sig)
+		}
+
+		if !stopped {
+			t.Errorf("stopSignalsが呼ばれていません (%v)", sig)
+		}
+
+		var entry map[string]any
+		if err := json.Unmarshal(logBuf.Bytes(), &entry); err != nil {
+			t.Fatalf("JSONログパース失敗: %v (raw=%s)", err, logBuf.String())
+		}
+		if entry["msg"] != "server stopped" || entry["level"] != "INFO" || entry["signal"] != sig.String() {
+			t.Errorf("停止ログ不正: got %v want signal=%s", entry, sig.String())
+		}
 	}
 }

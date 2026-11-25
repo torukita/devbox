@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/alecthomas/kong"
 )
@@ -67,7 +72,7 @@ func run(targetDir string) error {
 	if cfg.LogFile != "" {
 		logOutput = cfg.LogFile
 	}
-	logger.Info("起動",
+	logger.Info("server started",
 		slog.String("version", version),
 		slog.String("addr", cfg.Addr),
 		slog.String("base_dir", cfg.BaseDir),
@@ -78,11 +83,51 @@ func run(targetDir string) error {
 		slog.Bool("cloudflare", cfg.Cloudflare),
 	)
 
-	if err := http.ListenAndServe(cfg.Addr, loggingMiddleware(logger, cfg.Cloudflare, mux)); err != nil {
-		logger.Error("サーバー停止", slog.String("error", err.Error()))
-		return err
+	srv := &http.Server{
+		Addr:    cfg.Addr,
+		Handler: loggingMiddleware(logger, cfg.Cloudflare, mux),
 	}
-	return nil
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	return runServer(srv, logger, sigCh, func() { signal.Stop(sigCh) })
+}
+
+// runServer: HTTPサーバーを起動し、エラー終了または停止シグナル受信時にログを出してグレースフルシャットダウンする
+func runServer(srv *http.Server, logger *slog.Logger, sigCh <-chan os.Signal, stopSignals func()) error {
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+		close(errCh)
+	}()
+
+	select {
+	case err, ok := <-errCh:
+		if ok && err != nil {
+			logger.Error("server stopped", slog.String("error", err.Error()))
+			return err
+		}
+		return nil
+	case sig := <-sigCh:
+		// 1回目のシグナルを受信したら監視を止め、2回目のCtrl-Cでは即強制終了できるようにする
+		if stopSignals != nil {
+			stopSignals()
+		}
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+			logger.Error("server shutdown failed", slog.String("error", err.Error()))
+			return err
+		}
+		logger.Info("server stopped", slog.String("signal", sig.String()))
+		return nil
+	}
 }
 
 func newServeMux() *http.ServeMux {

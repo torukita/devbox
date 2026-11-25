@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"html/template"
 	"log/slog"
 	"math"
@@ -26,11 +27,9 @@ const (
 
 // requestMeta: ハンドラ間で共有し、最終的にloggingMiddlewareが出力するリクエストメタ情報
 type requestMeta struct {
-	Msg      string
-	Level    slog.Level
-	User     string
-	FileSize int64
-	HasFile  bool
+	Msg   string
+	Level slog.Level
+	User  string
 }
 
 func getRequestMeta(ctx context.Context) *requestMeta {
@@ -40,22 +39,15 @@ func getRequestMeta(ctx context.Context) *requestMeta {
 	return nil
 }
 
-// responseWriterWrapper: 出力されたHTTPステータスコードと送信バイト数をキャプチャするためのラッパー
+// responseWriterWrapper: 出力されたHTTPステータスコードをキャプチャするためのラッパー
 type responseWriterWrapper struct {
 	http.ResponseWriter
 	statusCode int
-	bytes      int64
 }
 
 func (rw *responseWriterWrapper) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
-}
-
-func (rw *responseWriterWrapper) Write(b []byte) (int, error) {
-	n, err := rw.ResponseWriter.Write(b)
-	rw.bytes += int64(n)
-	return n, err
 }
 
 // clientIP: X-Forwarded-Forヘッダー（先頭のIP）があればそれを、なければRemoteAddrを返す
@@ -80,12 +72,12 @@ func clientIP(r *http.Request, cloudflare bool) string {
 	return r.RemoteAddr
 }
 
-// loggingMiddleware: すべてのリクエストのアクセスログ（IP、ユーザー名、メソッド、URL、ステータスコード、処理時間）を出力
+// loggingMiddleware: すべてのリクエストのアクセスログ（HTTP概要、IP、ユーザー名、Cloudflare情報）を出力
 func loggingMiddleware(logger *slog.Logger, cloudflare bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		meta := &requestMeta{
-			Msg:   "アクセス",
+			Msg:   "request handled",
 			Level: slog.LevelInfo,
 			User:  "-",
 		}
@@ -96,9 +88,14 @@ func loggingMiddleware(logger *slog.Logger, cloudflare bool, next http.Handler) 
 
 		durationMs := math.Round(float64(time.Since(start).Microseconds())/10.0) / 100.0
 		ip := clientIP(r, cloudflare)
+		httpSummary := fmt.Sprintf("%s %s %d (%.2fms)", r.Method, r.URL.Path, wrapped.statusCode, durationMs)
 
-		attrs := make([]slog.Attr, 0, 12)
-		attrs = append(attrs, slog.String("ip", ip))
+		attrs := make([]slog.Attr, 0, 4)
+		attrs = append(attrs,
+			slog.String("http", httpSummary),
+			slog.String("ip", ip),
+			slog.String("user", meta.User),
+		)
 		if cloudflare {
 			country := strings.TrimSpace(r.Header.Get("CF-IPCountry"))
 			if country == "" {
@@ -108,21 +105,10 @@ func loggingMiddleware(logger *slog.Logger, cloudflare bool, next http.Handler) 
 			if cfRay == "" {
 				cfRay = "-"
 			}
-			attrs = append(attrs,
+			attrs = append(attrs, slog.Group("cf",
 				slog.String("country", country),
-				slog.String("cf_ray", cfRay),
-			)
-		}
-		attrs = append(attrs,
-			slog.String("user", meta.User),
-			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
-			slog.Int("status", wrapped.statusCode),
-			slog.Int64("bytes", wrapped.bytes),
-			slog.Float64("duration_ms", durationMs),
-		)
-		if meta.HasFile {
-			attrs = append(attrs, slog.Int64("file_size", meta.FileSize))
+				slog.String("ray", cfRay),
+			))
 		}
 
 		logger.LogAttrs(r.Context(), meta.Level, meta.Msg, attrs...)
@@ -165,7 +151,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		u := cfg.findUser(userInput, r.FormValue("pass"))
 		if u == nil {
 			if meta := getRequestMeta(r.Context()); meta != nil {
-				meta.Msg = "ログイン失敗"
+				meta.Msg = "user login failed"
 				meta.Level = slog.LevelWarn
 				if userInput != "" {
 					meta.User = userInput
@@ -184,7 +170,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if meta := getRequestMeta(r.Context()); meta != nil {
-			meta.Msg = "ログイン成功"
+			meta.Msg = "user login succeeded"
 			meta.User = u.User
 		}
 		http.SetCookie(w, &http.Cookie{
@@ -251,9 +237,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if meta := getRequestMeta(r.Context()); meta != nil {
-		meta.Msg = "ダウンロード"
-		meta.FileSize = info.Size()
-		meta.HasFile = true
+		meta.Msg = "file downloaded"
 	}
 
 	http.ServeFile(w, r, fullPath)

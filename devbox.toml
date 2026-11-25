@@ -1,7 +1,10 @@
-data_dir = "data"
 addr = ":8080"
 session_days = 1
+log_file = "" # 空なら標準出力、ファイル出力する場合は絶対パスを指定
+log_format = "text"
+cloudflare = false
 
+# 公開ファイルは contents/<directory>/ 配下に配置します
 [[users]]
 user = "demo"
 pass = "demo"

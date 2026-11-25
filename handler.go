@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"html/template"
-	"log"
+	"log/slog"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,13 +20,31 @@ type ctxKey string
 
 const (
 	userCtxKey        ctxKey = "user"
+	metaCtxKey        ctxKey = "request_meta"
 	sessionCookieName string = "session_id"
 )
 
-// responseWriterWrapper: 出力されたHTTPステータスコードをキャプチャするためのラッパー
+// requestMeta: ハンドラ間で共有し、最終的にloggingMiddlewareが出力するリクエストメタ情報
+type requestMeta struct {
+	Msg      string
+	Level    slog.Level
+	User     string
+	FileSize int64
+	HasFile  bool
+}
+
+func getRequestMeta(ctx context.Context) *requestMeta {
+	if meta, ok := ctx.Value(metaCtxKey).(*requestMeta); ok {
+		return meta
+	}
+	return nil
+}
+
+// responseWriterWrapper: 出力されたHTTPステータスコードと送信バイト数をキャプチャするためのラッパー
 type responseWriterWrapper struct {
 	http.ResponseWriter
 	statusCode int
+	bytes      int64
 }
 
 func (rw *responseWriterWrapper) WriteHeader(code int) {
@@ -32,60 +52,80 @@ func (rw *responseWriterWrapper) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+func (rw *responseWriterWrapper) Write(b []byte) (int, error) {
+	n, err := rw.ResponseWriter.Write(b)
+	rw.bytes += int64(n)
+	return n, err
+}
+
 // clientIP: X-Forwarded-Forヘッダー（先頭のIP）があればそれを、なければRemoteAddrを返す
+// cloudflare有効時はCF-Connecting-IPを最優先する
 // cloudflaredなどのプロキシ経由の場合、RemoteAddrはプロキシのアドレスになるため
-func clientIP(r *http.Request) string {
+func clientIP(r *http.Request, cloudflare bool) string {
+	if cloudflare {
+		if cfIP := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfIP != "" {
+			return cfIP
+		}
+	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		if idx := strings.Index(xff, ","); idx != -1 {
 			return strings.TrimSpace(xff[:idx])
 		}
 		return strings.TrimSpace(xff)
 	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
 	return r.RemoteAddr
 }
 
 // loggingMiddleware: すべてのリクエストのアクセスログ（IP、ユーザー名、メソッド、URL、ステータスコード、処理時間）を出力
-func loggingMiddleware(next http.Handler) http.Handler {
+func loggingMiddleware(logger *slog.Logger, cloudflare bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		meta := &requestMeta{
+			Msg:   "アクセス",
+			Level: slog.LevelInfo,
+			User:  "-",
+		}
+		ctx := context.WithValue(r.Context(), metaCtxKey, meta)
 		wrapped := &responseWriterWrapper{ResponseWriter: w, statusCode: http.StatusOK}
 
-		next.ServeHTTP(wrapped, r)
+		next.ServeHTTP(wrapped, r.WithContext(ctx))
 
-		duration := time.Since(start)
+		durationMs := math.Round(float64(time.Since(start).Microseconds())/10.0) / 100.0
+		ip := clientIP(r, cloudflare)
 
-		// ログイン中のユーザー名を取得（セッションCookieが存在すれば取得）
-		userName := "-"
-		if cookie, err := r.Cookie(sessionCookieName); err == nil {
-			if u := sessions.Get(cookie.Value); u != nil {
-				userName = u.User
+		attrs := make([]slog.Attr, 0, 12)
+		attrs = append(attrs, slog.String("ip", ip))
+		if cloudflare {
+			country := strings.TrimSpace(r.Header.Get("CF-IPCountry"))
+			if country == "" {
+				country = "-"
 			}
-		}
-
-		ip := clientIP(r)
-
-		// ダウンロードリクエストの場合は [DOWNLOAD] として出力
-		if strings.HasPrefix(r.URL.Path, "/download/") {
-			filename := filepath.Base(strings.TrimPrefix(r.URL.Path, "/download/"))
-			log.Printf("[DOWNLOAD] IP: %s | user: %s | file: %s %d (%v)",
-				ip,
-				userName,
-				filename,
-				wrapped.statusCode,
-				duration,
+			cfRay := strings.TrimSpace(r.Header.Get("CF-Ray"))
+			if cfRay == "" {
+				cfRay = "-"
+			}
+			attrs = append(attrs,
+				slog.String("country", country),
+				slog.String("cf_ray", cfRay),
 			)
-			return
+		}
+		attrs = append(attrs,
+			slog.String("user", meta.User),
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", wrapped.statusCode),
+			slog.Int64("bytes", wrapped.bytes),
+			slog.Float64("duration_ms", durationMs),
+		)
+		if meta.HasFile {
+			attrs = append(attrs, slog.Int64("file_size", meta.FileSize))
 		}
 
-		// 通常のリクエストは [ACCESS] として出力
-		log.Printf("[ACCESS]   IP: %s | user: %s | %s %s %d (%v)",
-			ip,
-			userName,
-			r.Method,
-			r.RequestURI,
-			wrapped.statusCode,
-			duration,
-		)
+		logger.LogAttrs(r.Context(), meta.Level, meta.Msg, attrs...)
 	})
 }
 
@@ -101,6 +141,9 @@ func sessionMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		if user == nil {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
+		}
+		if meta := getRequestMeta(r.Context()); meta != nil {
+			meta.User = user.User
 		}
 		ctx := context.WithValue(r.Context(), userCtxKey, user)
 		next(w, r.WithContext(ctx))
@@ -118,8 +161,16 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid request", http.StatusBadRequest)
 			return
 		}
-		u := cfg.findUser(r.FormValue("user"), r.FormValue("pass"))
+		userInput := r.FormValue("user")
+		u := cfg.findUser(userInput, r.FormValue("pass"))
 		if u == nil {
+			if meta := getRequestMeta(r.Context()); meta != nil {
+				meta.Msg = "ログイン失敗"
+				meta.Level = slog.LevelWarn
+				if userInput != "" {
+					meta.User = userInput
+				}
+			}
 			tmpl.ExecuteTemplate(w, "login.html", struct{ Error string }{
 				Error: "Invalid username or password",
 			})
@@ -131,6 +182,10 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, "could not make session", http.StatusInternalServerError)
 			return
+		}
+		if meta := getRequestMeta(r.Context()); meta != nil {
+			meta.Msg = "ログイン成功"
+			meta.User = u.User
 		}
 		http.SetCookie(w, &http.Cookie{
 			Name:     sessionCookieName,
@@ -151,7 +206,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(userCtxKey).(*UserConfig)
 
-	mdPath := filepath.Join(cfg.DataDir, u.Directory, "index.md")
+	mdPath := filepath.Join(cfg.ContentsDir(), u.Directory, "index.md")
 	content, err := os.ReadFile(mdPath)
 	if err != nil {
 		http.Error(w, "Page not found", http.StatusNotFound)
@@ -181,13 +236,24 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(userCtxKey).(*UserConfig)
 
-	filename := strings.TrimPrefix(r.URL.Path, "/download/")
-	filename = filepath.Base(filename) // ディレクトリ部分を除去して直下のファイルのみ許可
-
-	fullPath := filepath.Join(cfg.DataDir, u.Directory, filename)
-	if _, err := os.Stat(fullPath); err != nil {
+	rawPath := strings.TrimPrefix(r.URL.Path, "/download/")
+	filename := filepath.Base(rawPath) // ディレクトリ部分を除去して直下のファイルのみ許可
+	if rawPath == "" || filename == "." || filename == ".." || filename == "/" {
 		http.Error(w, "ファイルが見つかりません", http.StatusNotFound)
 		return
+	}
+
+	fullPath := filepath.Join(cfg.ContentsDir(), u.Directory, filename)
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		http.Error(w, "ファイルが見つかりません", http.StatusNotFound)
+		return
+	}
+
+	if meta := getRequestMeta(r.Context()); meta != nil {
+		meta.Msg = "ダウンロード"
+		meta.FileSize = info.Size()
+		meta.HasFile = true
 	}
 
 	http.ServeFile(w, r, fullPath)
